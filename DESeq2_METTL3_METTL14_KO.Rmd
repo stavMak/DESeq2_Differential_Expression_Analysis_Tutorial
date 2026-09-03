@@ -1,0 +1,489 @@
+---
+title: "DE Analysis of METTL3 and METLL14 KO in Drosophila"
+author: "Stavroula Makri"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    fig_caption: yes
+    number_sections: no
+    theme: cerulean
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    toc_collapsed: yes
+    fig_width: 8 
+    fig_height: 4 
+  bookdown::pdf_document2:
+    fig_caption: yes
+    number_sections: no
+    toc: yes
+    toc_depth: 3
+graphics: yes
+header-includes:
+- \makeatletter\renewcommand*{\fps@figure}{h}\makeatother
+- \usepackage{placeins}
+geometry: margin=1in
+fontsize: 18pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Introduction
+This notebook takes RNA-seq expression data of drosophila melanogaster and identifies differentially expressed genes between four experimental groups. At first, it analyzes differentially expressed genes between METTL3 knockouts samples and their references. Subsequently, between METTL14 KO samples and their references. Once completed, the changes of the two experiments will be compared. 
+
+### Loading the libraries
+
+DESeq estimate variance-mean dependence in count data from high-throughput sequencing assays and test for differential expression based on a model using the negative binomial distribution. Here, we are loading the package. 
+```{r, message=FALSE}
+###### Loading the package DESeq2
+library(DESeq2)
+library("pheatmap")
+library("RColorBrewer")
+library(ggplot2)
+library(ggrastr)
+library(dplyr)
+library(rtracklayer)
+library("ggrepel")
+library(UpSetR)
+library(ggvenn)
+```
+
+### Data import
+The first step is to import the different tables which were modified after Quality Control, Adapter trimming and genome Mapping. Each table represents a different sample and contains information about the number of RNA-seq reads that fell into each gene in the genome. 
+```{r,}
+# Specify path to directory with count output tables for each condition
+mydir <- "/home/stavroula/Desktop/erasmus/DEseq2/counts/" 
+res_dir <- "/home/stavroula/Desktop/erasmus/DEseq2/results_tables/"
+
+# set thresholds for log2 fold change and adjusted p value (to easily test different values)
+#lfcThreshold = 1
+padj.threshold = 0.01
+
+# define gene type for this analysis (to easily run the same code on the second gene type later)
+gene.type = "Mettl3"
+#gene.type = "Mettl14"
+
+# Get all files within mydir which contain the pattern "bam.txt" in their file name
+myFiles = list.files(mydir, pattern="bam.txt")
+
+# Remove excess information from samples names
+sampleName = sub("_._EKD.*", "", myFiles)
+sampleName = sub("count_trim_", "", sampleName)
+
+# Rename all files within myFiles 
+names(myFiles) <- sampleName
+
+sampleName
+```
+The format of these tables can't be used for the creation of `DESeqDataSet`. So, in this step we create a merged count table in which the gene IDs represent in the first column and numbers of RNA-seq reads per gene of each sample in the following columns. 
+
+```{r,}
+# Create a count table
+countTable <- sapply(myFiles, function(x){
+  data <- read.table(paste0(mydir, x), header = TRUE)
+  tmp2 = data[,7] 
+  names(tmp2) <- data[,1]
+  return(tmp2)
+})
+# Look at the countTable
+head(countTable)
+```
+We build a table which contains information about the condition and the gene type of each sample, called `colData`. It is necessary for the creation of the `DESeqDataSet`. 
+
+```{r, results="hide"}
+# split sample names to extract condition & replicate
+info = strsplit(sampleName, "_", fixed=TRUE)
+
+#making coldata table
+coldata <- data.frame(sampleName = sampleName,
+                      condition = factor(paste(sapply(info, "[[", 2), sapply(info, "[[", 1 ))),
+                      gene.type = factor(sapply(info, "[[", 1 )))
+# look at the coldata table
+coldata
+```
+Then we build the `DESeqDataSet` using the `DESeqDataSetFromMatrix` function. `DESeqDataSet` is a subclass of `RangedSummarizedExperiment`, used to store the input values, intermediate calculations and results of an analysis of differential expression. 
+
+```{r,  results="hide", message=FALSE}
+# make DESeqDataSet object
+dds <- DESeqDataSetFromMatrix(countData = countTable,
+                              colData = coldata,
+                              design = ~ condition)
+# inspect DESeqDataSet
+dds
+
+# look at counts that were imported into DESeqDataSet
+head(counts(dds))
+```
+### Building the DESeq2 model
+ 
+The parameter `design` = ~condition specifies that the effect to be tested in the analysis is given in the column condition of the `colData` table. The design starts with the tilde symbol `~`, which means, model the counts (log2 scale) using the following formula. The function `DESeq()` is a convenient wrapper function that runs all core steps of the DESeq2 analysis. These include the estimation of the sizeFactors to correct for differences in library size, the dispersion estimation and the model adjustment. The function `sizeFactors()` outputs the calculated sizeFactors. In order to normalise the read counts in the columns of the count table, the function `DESeq()` internally divides each column by the associated sizeFactor of this sample. The function `counts()` allows to output the read counts before and after sizeFactor normalisation by setting the parameter normalized=FALSE/TRUE .
+```{r, message=FALSE}
+# run analysis
+dds <- DESeq(dds)
+
+#check all the comparisons
+#resultsNames(dds)
+
+#counts(dds)
+```
+### Initial quality control
+#### Heatmap of sample similarities
+A useful approach for general quality control is the comparison of similarities between the different samples. For this, the gene counts of the `DESeqDataSet` are first subjected to regularised log transformation (rlog) and then input into the function `dist()` to calculate pairwise Euclidean distances. The pairwise similarities can be displayed as heatmap, which allows to assess general quality and successful treatment for each sample. Our purpose is the detection of differentially expressed genes, and we are looking in particular for samples whose experimental treatment suffered from an anormality that renders the data points obtained from these particular samples detrimental to our purpose.
+```{r}
+# calculate samples distances using pipe notation
+rld <- rlog(dds, blind=FALSE)
+sampleDists <- dist(t(assay(rld)))
+
+# convert data into a matrix
+sampleDistMatrix <- as.matrix(sampleDists)
+
+# define colour gradient
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+pheatmap(sampleDistMatrix, 
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+```
+
+#### Principle component analysis
+
+Principle component analysis (PCA) is a dimensionality reduction method which allows to detect patterns in the data in an unsupervised manner. In principal, it is a useful diagnostic for examining relationships between samples. The function `plotPCA()` is a part of the DESeq2 package. 
+```{r}
+# capture data from plotPCA()
+pcaData <- plotPCA(rld, intgroup=c("gene.type","condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"), digits=1)
+
+ggplot(pcaData, aes(x=PC1, y=PC2, color=condition, shape=gene.type)) +
+geom_point(size=3) +
+xlab(paste0("PC1: ",percentVar[1],"% variance")) + # change label x axis
+ylab(paste0("PC2: ",percentVar[2],"% variance")) + # change label y axis
+coord_fixed() +
+theme(aspect.ratio = 1) 
+
+```
+
+# Differential expression of Mettl3
+The function `results()` retrieves the results of the statistical test. Defaults values were used for the alpha and lfcThreshold parameters. The defaults are `alpha=0.1` and `lfcThreshold=0`. The `contrast` argument allows us to specify what results table should be built. In principal, with contrast we can define which levels in condition should serve as treatment and reference. In this case, we use “ctrl Mettl3” as reference condition and “KO Mettl3” as treatment.
+```{r}
+# Generate a results table with default settings for METTL3
+res_1 = results(dds, contrast=c("condition", paste("ctrl", gene.type, sep =" "), paste("KO", gene.type, sep =" ")))
+res = subset(res_1, res_1$baseMean >= 1)
+head(res)
+```
+A summary of the results can be generated. 
+```{r}
+# Summarise results
+summary(res)
+```
+### Downregulation and upregulation 
+In this step, we investigate the upregulated genes. The function `order()` is used and allows to sort the regulated genes by different criteria, in this case by log2FoldChange. 
+```{r}
+# extract the 10 most upregulated genes
+TopUP <- res[order(res$log2FoldChange, decreasing = TRUE), ]
+TopUP <- TopUP[1:10,]
+#head(TopUP)
+```
+We create a file which contains the upregulated genes with `padj < 0.01` and `log2FoldChange > 1`
+```{r}
+# extract list of upregulated genes with padj < 0.01 and log2 fold change > 1      
+SigGenesUP <- subset(res, padj < padj.threshold & log2FoldChange > 1)
+
+# export upregulated genes
+file_name = paste0(gene.type,"_DESeq2_TKO_up.tab" )
+write.table(SigGenesUP, file = paste0(res_dir, file_name), quote=FALSE, sep="\t")
+```
+Also, we extract the 200 most downregulated genes based on log2FoldChange, and we save them.   
+```{r}
+# List of gene names for 200 most downregulated genes 
+TopDown200 <- res[order(res$log2FoldChange, decreasing=FALSE), ]
+TopDown200 <- TopDown200[1:200,]
+#head(TopDown200)
+file_name_TD = paste0(gene.type, "_TopDown200.txt")
+writeLines(rownames(TopDown200), paste0(res_dir,file_name_TD))
+```
+### Visualisation
+
+#### MA plot
+The MA-plot provides a global view of the differential genes, with the log2 fold change on the y-axis over the mean of normalized counts, after sizeFactor normalisation. In principal, this plot shows that the spread of log2FoldChange values changes with the amount of reads, such that genes with low mean read count tend to get higher log2FoldChange values. Genes that are significant according to the chosen significance level alpha (default alpha=0.1 ) are coloured in blue, all other genes are in grey. 
+
+```{r}
+# MA plot (with default log2 fold change cutoff)
+plotMA(res, main = paste("MA plot", gene.type, sep = " ")) 
+```
+
+The following code represents the log2 Fold Change shrinkage function or Shrinkage of effect size (LFC estimates). The `lfcShrink()` function removes the noise in the log2FoldChanges values of genes with low read counts. This function only corrects the effect size, but does not affect the significance (P values and adjusted P values) in any way. In addition, we transfer the shrunken log2FoldChange values as an additional column into results table res. 
+```{r}
+# calculate shrunken log2Foldchanges
+res_shrink <- lfcShrink(dds=dds, contrast = c("condition", paste("ctrl", gene.type, sep =" "), paste("KO", gene.type, sep =" ")), type = "ashr")
+
+res_shrink = subset(res_shrink, res_shrink$baseMean >= 1)
+
+## MA plot with shrunken log2Foldchanges
+plotMA(res_shrink, main = paste("MA plot with shrunken fold changes", gene.type, sep = " "))
+
+# transfer shrunken log2FoldChanges as new column to res
+res$log2FoldChange.shrink <- res_shrink$log2FoldChange
+```
+
+#### ggplot
+In this step we visualize differential expression analysis with the aid of ggplot. First, we need to transform the res to a dataframe. Then, we create a plot with the -log10(padj) on the y-axis over the log10(baseMean), filtered by padj < padj.threshold. Also, we use the `ggrastr::rasterise` function which reduce the size of the plot. 
+```{r}
+#tranform res to a dataframe
+res_df = as.data.frame(res)
+
+# using ggrastr::rasterise() around geom_point reduces the resulting image size
+ggplot(res_df, aes(x=log10(baseMean), y=-log10(padj), col=padj < padj.threshold)) +
+  ggrastr::rasterise(geom_point(), dpi=300)
+```
+
+Here, we visualize the regulation of the genes. We create a plot that shows the up-down regulation of the genes. The `mutate()` is an alternative way to add a new column at res_df which characterizes the regulation of each gene. So, using the functions `mutate()` and `case_when()` from the package dyplr can futher split into up- and down-regulation to assign separate colours for either direction.
+
+```{r}
+#creating a column which characterizes the genes with padj < 0.01 as True and the other as False 
+res_df$regulated <- res_df$padj < padj.threshold
+res_df$regulated[is.na(res_df$regulated)] <- FALSE
+
+# mutate() is an alternative way to add a new column (here: up_down)
+# case_when() allows to define different scenarios
+res_df <- mutate(res_df, up_down= case_when(
+  regulated & log2FoldChange > 0 ~ "up",
+  regulated & log2FoldChange < 0 ~ "down",
+  TRUE ~ "not"
+))
+
+# convert into factor
+res_df$up_down <- factor(res_df$up_down)
+
+# colour by direction of regulation
+ggplot(res_df, aes(x=log10(baseMean), y=log2FoldChange.shrink, col=up_down)) +
+  ggrastr::rasterise(geom_point(), dpi=300) +
+  scale_color_manual(values = c(`up` = "blue", `not` = "black",
+                                `down` = "dodgerblue"))
+```
+
+#### Volcano plot
+A volcano plot is a type of scatter plot represents up down regulation of the genes. On the x-axis we have the log2FoldChange and on the y-axis adjusted P value. Each gene is represented by one dot. Genes that are significant according to the chosen significance level are coloured differently. Padj it will transfer by -2 scale. 
+```{r}
+# Volcano plot 
+ggplot(res_df, aes(x=log2FoldChange, y=-log10(padj),
+                  col=up_down)) +
+  ggrastr::rasterise(geom_point(), dpi=300) +
+  scale_color_manual(values = c(`up` = "blue", `not` = "black",
+                                `down` = "dodgerblue")) +
+  coord_cartesian(ylim=c(-10,300))
+```
+
+#### P value distribution
+Plot shows the distribution of P values in a histogram. For comparison, the same plot can be obtained for the adjusted P values to see the impact of multiple testing correction. 
+
+```{r}
+# histogram of P valuesimpact of
+hist(res$pvalue, main = "P value distribution of Mettl3")
+
+# histogram of adjusted P values
+hist(res$padj, main = "padj distribution of Mettl3")
+```
+
+### Adding annotation to the DESeq2 results
+The only annotation we can see in our results is the Ensembl Gene ID, which is not very informative. So, in this step we want to add more information about the genes. The following code shows two ways to add annotation. The first method is to do this using `biomart`, an interface to the BioMart resource. The other one is using the `rtracklayer` package and the function `import.gff()`. 
+```{r}
+#import ensembl data
+gff = import.gff("http://ftp.ensembl.org/pub/release-104/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.32.104.gtf.gz")
+
+# Create a column for gene.IDs to annotated them
+gene.IDs = substr(rownames(res_df), 1, 11)
+res_df$gene.ID = gene.IDs
+
+# Annotating the genes contained in res
+res_df$gene.name = gff$gene_name[match(res_df$gene.ID, gff$gene_id)]
+
+# add additional column with ENSEMBL gene IDs without version extension
+#res_df$ensembl.ID.version = rownames(res_df)
+#res_df$ensembl.ID = substr(res_df$ensembl.ID.version, 1, 11)
+
+# initialise mart object
+#ensembl <- useEnsembl(biomart = "genes", dataset = "dmelanogaster_gene_ensembl", mirror = "uswest")
+#ensembl
+
+# check available filters
+#filters <- listFilters(ensembl)
+#filters[1:5,]
+
+# check available attributes
+#attributes <- listAttributes(ensembl)
+#attributes[1:5,]
+
+# use the function View() in the console to browse through the full list
+# of available filters and attributes
+#View(filters)
+#View(attributes)
+
+# get gene name and description for all genes in res
+# anno <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description"),
+#               filters = "ensembl_gene_id",
+#               values = res$gene.ID, 
+#               mart = ensembl)
+
+# # check whether all genes in res were found in the database
+# all(res$gene.ID %in% anno$ensembl_gene_id)
+# table(res$gene.ID %in% anno$ensembl_gene_id)
+# head(res$gene.ID[!res$gene.ID %in% anno$ensamble_gene_id])
+
+# # add annotation to res
+# res_df = merge(res_df, anno, by.x="gene.ID", by.y="ensembl_gene_id", all=TRUE)
+# head(res_df)
+```
+### Saving the results object 
+Saving the results allows us to load them into the following script, as we want to compare the DESeq2 results of the two experiments.
+```{r, results="hide", message=FALSE} 
+# save extended results table 
+table_name = paste(gene.type, "results_table.RData", sep = "_") 
+save(res_df, file=paste0(res_dir, table_name)) 
+``` 
+
+# Differential expression of Mettl14
+
+On this section, we see only code about the plots of Differential Expression analysis of Mettl14 KO. To avoid duplicated code in our script, we defined the variable gene_type for this analysis to easily run the same code on Mettl14 KO. Once we ran the code with `gene_type = Mettl14`, we obtained the result table of this gene. Thus, we can load it and use the results directly on the plots. 
+```{r}
+# load and rename table for METTL14
+load(paste0(res_dir, "Mettl14_results_table.RData"))
+res_Mettl14 = res_df
+rm(res_df)
+
+# rename res for METTL14
+res_ND_Mettl14 = res
+rm(res)
+
+# rename res_shrink for METTL14
+res_shrink_Mettl14 = res_shrink
+rm(res_shrink)
+```
+
+A summary of the results can be generated. 
+```{r}
+# Summarise results
+summary(res_ND_Mettl14)
+```
+
+### Visualisation
+#### MA plot
+```{r}
+# MA plot (with default log2 fold change cutoff)
+plotMA(res_ND_Mettl14, main = "MA plot Mettl14")
+```
+
+```{r}
+plotMA(res_shrink_Mettl14, main = "MA plot with shrunken fold changes Mettl14") 
+```
+
+#### ggplot
+
+```{r}
+# colour by direction of regulation
+ggplot(res_Mettl14, aes(x=log10(baseMean), y=log2FoldChange, col=up_down)) +
+  ggrastr::rasterise(geom_point(), dpi=300) +
+  scale_color_manual(values = c(`up` = "blue", `not` = "black",
+                                `down` = "dodgerblue"))
+```
+
+#### Volcano plot
+```{r}
+ggplot(res_Mettl14, aes(x=log2FoldChange, y=-log10(padj),
+                        col=up_down)) +
+  ggrastr::rasterise(geom_point(), dpi=300) +
+  scale_color_manual(values = c(`up` = "blue", `not` = "black",
+                                `down` = "dodgerblue")) +
+  coord_cartesian(ylim=c(-10,300))
+```
+
+#### P value distribution
+
+```{r}
+
+# histogram of P values 
+hist(res_Mettl14$pvalue, main = "P value distribution of Mettl14")
+
+# histogram of adjusted P values
+hist(res_Mettl14$padj, main = "Adjusted P value distribution of Mettl14")
+```
+
+# Comparison the changes from two experiments
+ 
+The last part of the script compares the results tables of METTL14 and METTL3 KO. First, we load the result table for Mettl3. Then, we should confirm that both tables have the same size, contain the same genes and both table are in the same order. After that, we create a merged table of both tables because it's easier to use it in the plots.  
+
+```{r}
+# load and rename table for METTL3
+load(paste0(res_dir, "Mettl3_results_table.RData"))
+res_Mettl3 = res_df
+rm(res_df)
+
+# confirm that both tables have the same size
+dim(res_Mettl3)
+dim(res_Mettl14)
+
+# contain the same genes
+all(res_Mettl3$gene.ID %in% res_Mettl14$gene.ID)
+
+# both table are in the same order
+all(res_Mettl3$gene.ID == res_Mettl14$gene.ID)
+
+# merge both tables (all columns in by= will appear only once)
+res_all = merge(res_Mettl3, res_Mettl14, suffixes=c("_Mettl3", "_Mettl14"), by=c("gene.ID", "gene.name"))
+# use View() for a better visualisation of data.frames in RStudio
+View(res_all)
+```
+
+### Visualization
+#### Scatter plot
+One way to overlay the two experiments is to directly compare the log2 Fold Changes in a scatter plot. In these data there are very lowly expressed genes. So, we use the `shrink()` function to remove them and avoid the noise. So the following plots show the interaction of Mettl3 and Mettl14 KO conditions, based on log2FoldChange of each gene. 
+```{r}
+# label points by regulation in the two experiments (using interaction())
+ggplot(res_all, aes(x=log2FoldChange.shrink_Mettl3,
+                    y=log2FoldChange.shrink_Mettl14,
+                    col=interaction(up_down_Mettl3, up_down_Mettl14))) +
+ggrastr::rasterise(geom_point(), dpi=300)
+```
+
+```{r}
+# highlight consistent / inconsistent regulation
+ggplot(res_all, aes(x=log2FoldChange.shrink_Mettl3,
+                    y=log2FoldChange.shrink_Mettl14,
+                    col=interaction(up_down_Mettl3, up_down_Mettl14))) +
+    scale_color_manual(values = c(`down.down` = "blue", `up.up` = "blue",
+                                  `not.not` = "lightgrey",
+                                  `not.up` = "darkgrey", `up.not` = "darkgrey",
+                                  `not.down` = "darkgrey", `down.not` = "darkgrey",
+                                  `down.up` = "orange", `up.down` = "orange")) +
+ggrastr::rasterise(geom_point(), dpi=300)
+```
+
+#### UpSet plot
+Another way to see the interaction between the different conditions is with `UpSet plot`. It provides an efficient way to visualize intersections of multiple sets compared to the traditional approaches, i.e. the Venn Diagram. The first plot presents the upregulated genes on Mettl14 KO and Mettl3 KO conditions and on the second one, the downregulated genes of the same conditions. The mean purpose is to see how good they overlapped each other.
+```{r}
+UP = list(Mettl14_Up = filter(res_all, up_down_Mettl14 == "up")$gene.ID,
+          Mettl3_Up = filter(res_all, up_down_Mettl3 == "up")$gene.ID)
+UpSetR::upset(fromList(UP))
+```
+```{r}
+DOWN = list(Mettl14_Down = filter(res_all, up_down_Mettl14 == "down")$gene.ID,
+            Mettl3_Down = filter(res_all, up_down_Mettl3 == "down")$gene.ID)
+UpSetR::upset(fromList(DOWN))
+```
+
+### Venn Diagram
+```{r}
+ggvenn( UP, 
+        fill_color = c("#5F4B6D", "#F895A9"),
+        stroke_size = 0.3, set_name_size = 2
+  )
+ggvenn( DOWN, 
+        fill_color = c("#868686FF", "#CD534CFF"),
+        stroke_size = 0.3, set_name_size = 2
+  )
+
+```
+
